@@ -53,16 +53,21 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           cd backend
           pip install -r requirements.txt
 
       - name: Test backend imports
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          # backend/ for the `app` package, repo root for `mlops`
+          PYTHONPATH: ${{ github.workspace }}/backend:${{ github.workspace }}
         run: |
-          python -c "from backend.app.core.config import settings; print('✅ Config import OK')" || echo "::warning::Config import failed"
-          python -c "from backend.app.models.deep_learning import DeepTaxaClassifier; print('✅ Model import OK')" || echo "::warning::Model import failed"
-          python -c "from backend.app.services.model_loader import ModelLoader; print('✅ Service import OK')" || echo "::warning::Service import failed"
+          python -c "from app.core.config import settings; print('✅ Config import OK')"
+          python -c "from app.core.security import ROLE_PERMISSIONS; print('✅ Security import OK')"
+          python -c "from app.db.models import Base; print('✅ Database models import OK')"
+          python -c "from app.models.deep_learning import DeepTaxaClassifier; print('✅ Model import OK')"
+          python -c "from app.services.model_loader import ModelLoader; print('✅ Service import OK')"
+          python -c "from app.main import app; print('✅ FastAPI app import OK')"
 
       - name: Test MLOps imports
         env:
@@ -72,7 +77,7 @@ jobs:
           python -c "from mlops.monitoring import MonitoringManager; print('✅ Monitoring import OK')"
           python -c "from mlops.model_versioning import ModelVersionRegistry; print('✅ Versioning import OK')"
           python -c "from mlops.ab_testing import ABTestManager; print('✅ A/B Testing import OK')"
-          python -c "from mlops.advanced_security import SecurityManager; print('✅ Security import OK')"
+          python -c "from mlops.export_formats import ExportManager; print('✅ Export import OK')"
 
       - name: Test MLOps functionality
         env:
@@ -157,8 +162,28 @@ jobs:
         continue-on-error: true
 
   build-test:
-    name: Test Application Build
+    name: Integration Tests
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [sqlite, postgres]
 
     steps:
       - name: Checkout code
@@ -171,17 +196,36 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd backend
           pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          cd backend
           pip install -r requirements.txt
 
-      - name: Verify FastAPI app loads
+      - name: Run integration tests (${{ matrix.database }})
         env:
           PYTHONPATH: ${{ github.workspace }}
+          TEST_DATABASE_URL: ${{ matrix.database == 'postgres' && 'postgresql://test:test@localhost:5432/test' || '' }}
         run: |
-          python -c "
-          import sys
-          sys.path.insert(0, 'backend')
-          print('✅ Imports verified')
-          print('✅ Application structure OK')
-          "
+          cd backend
+          if [ -z "$TEST_DATABASE_URL" ]; then unset TEST_DATABASE_URL; fi
+          python -m pytest tests -v -W ignore::DeprecationWarning
+
+  frontend:
+    name: Frontend Type-check and Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and build
+        run: npm run build
