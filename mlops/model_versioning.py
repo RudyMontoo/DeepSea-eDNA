@@ -78,6 +78,8 @@ class ModelVersionRegistry:
     
     def _calculate_checksum(self, model_path: Path) -> str:
         """Calculate checksum for model file"""
+        if not model_path.is_dir():
+            return "n/a"  # not a local folder (e.g. an MLflow models:/ URI, which tracks its own artifacts)
         try:
             # Check for .pth or .h5 file
             model_file = None

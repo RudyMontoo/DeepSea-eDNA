@@ -14,9 +14,10 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_permission
 from app.core.config import settings
-from app.core.security import Permission
+from app.core.security import Permission, utcnow
 from app.db.models import Prediction, User
 from app.db.session import get_db
+from app.services import serving
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,10 @@ def history_entry(user: User, sequence: str, data: Dict[str, Any], source: str, 
     )
 
 
+def cache_key(req: Request, sequence: str) -> str:
+    return req.app.state.cache_manager.generate_cache_key(sequence, prefix=serving.cache_prefix(req.app.state.model_info))
+
+
 def record_ab_test(req: Request, confidence: float, success: bool = True):
     """Attribute a prediction to the running A/B experiment, if any"""
     ab_manager = getattr(req.app.state, "ab_test_manager", None)
@@ -111,6 +116,34 @@ def record_ab_test(req: Request, confidence: float, success: bool = True):
     variant = next((v for v in experiment.variants if v.version_id == version_id), None)
     if variant:
         ab_manager.record_prediction(experiment.experiment_id, variant.variant_id, confidence, success)
+
+
+@router.get("/model/serving")
+def serving_model(req: Request, _: User = Depends(require_permission(Permission.MODEL_VIEW))):
+    """Which model version is answering predictions, and where it was loaded from"""
+    return {**req.app.state.model_info, "mlflow_enabled": serving.mlflow_enabled()}
+
+
+@router.post("/model/reload")
+def reload_model(req: Request, user: User = Depends(require_permission(Permission.MODEL_MANAGE))):
+    """
+    Reload models:/<name>@<alias> from MLflow (e.g. after promoting a new champion), without a restart
+    """
+    if not serving.mlflow_enabled():
+        raise HTTPException(status_code=409, detail="MLflow is not configured (set MLFLOW_TRACKING_URI)")
+    try:
+        loader, info = serving.load_from_mlflow()
+    except Exception as e:
+        logger.error(f"Model reload failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not load the model from MLflow: {e}")
+
+    info["loaded_at"] = utcnow().isoformat()
+    previous = req.app.state.model_info
+    # Swap references; in-flight requests finish on the old model, which is then garbage-collected
+    req.app.state.model_loader, req.app.state.model_info = loader, info
+    serving.sync_version_registry(req.app.state.version_registry, info)
+    logger.info(f"{user.username} reloaded model: v{previous.get('version')} -> v{info['version']}")
+    return {"previous_version": previous.get("version"), **info}
 
 
 @router.get("/models")
@@ -170,8 +203,8 @@ def predict_sequence(
     if monitoring:
         monitoring.increment_prediction_count()
 
-    cache_key = cache_manager.generate_cache_key(sequence) if cache_manager else None
-    cached_result = cache_manager.get(cache_key) if (request.use_cache and cache_manager) else None
+    key = cache_key(req, sequence) if cache_manager else None
+    cached_result = cache_manager.get(key) if (request.use_cache and cache_manager) else None
 
     if cached_result:
         if monitoring:
@@ -194,7 +227,7 @@ def predict_sequence(
         response_data = format_prediction(predictions[0])
         record_ab_test(req, response_data["confidence"])
         if request.use_cache and cache_manager:
-            cache_manager.set(cache_key, response_data, ttl=3600)  # 1 hour TTL
+            cache_manager.set(key, response_data, ttl=3600)  # 1 hour TTL
 
     db.add(history_entry(user, sequence, response_data, source="single"))
     db.commit()
@@ -235,7 +268,7 @@ def predict_batch(
     results: List[Optional[Dict[str, Any]]] = [None] * len(sequences)
     misses = []
     for i, seq in enumerate(sequences):
-        cached = cache_manager.get(cache_manager.generate_cache_key(seq)) if (request.use_cache and cache_manager) else None
+        cached = cache_manager.get(cache_key(req, seq)) if (request.use_cache and cache_manager) else None
         if cached:
             results[i] = {**cached, "cached": True}
             if monitoring:
@@ -253,7 +286,7 @@ def predict_batch(
                 results[i] = data
                 record_ab_test(req, data["confidence"])
                 if request.use_cache and cache_manager:
-                    cache_manager.set(cache_manager.generate_cache_key(sequences[i]), data, ttl=3600)
+                    cache_manager.set(cache_key(req, sequences[i]), data, ttl=3600)
     except Exception as e:
         logger.error(f"Batch prediction error: {e}")
         if monitoring:

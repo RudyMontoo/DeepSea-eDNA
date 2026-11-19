@@ -6,6 +6,7 @@ import os
 import sys
 import logging
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple, Dict
 import torch
@@ -100,7 +101,7 @@ class eDNADataset(Dataset):
         return seq_tensor, label_tensor
 
 
-def load_training_data(data_dir: str) -> Tuple[List[str], List[int], dict]:
+def load_training_data(data_dir: str, max_per_class: int = None) -> Tuple[List[str], List[int], dict]:
     """
     Load training data from directory
     Expected format:
@@ -110,6 +111,7 @@ def load_training_data(data_dir: str) -> Tuple[List[str], List[int], dict]:
       - class_1/
         - sequences.fasta
       - taxonomy.json (mapping of class IDs to taxonomy)
+    max_per_class keeps only the first N sequences of each class (quick runs)
     """
     sequences = []
     labels = []
@@ -138,6 +140,8 @@ def load_training_data(data_dir: str) -> Tuple[List[str], List[int], dict]:
         for fasta_file in class_dir.glob('*.fasta'):
             try:
                 records = processor.parse_file(str(fasta_file))
+                if max_per_class:
+                    records = records[:max(0, max_per_class - labels.count(class_id))]
                 for record in records:
                     sequences.append(str(record.seq))
                     labels.append(class_id)
@@ -305,7 +309,7 @@ def plot_confusion_matrix(cm: np.ndarray, output_dir: str, class_names: List[str
     """
     Plot confusion matrix
     """
-    plt.figure(figsize=(10, 8))
+    plt.figure(figsize=(12, 10))
     sns.heatmap(
         cm,
         annot=True,
@@ -335,10 +339,14 @@ def train_classifier(
     early_stopping_patience: int = 15,
     tune_hyperparameters: bool = False,
     use_cross_validation: bool = False,
-    n_folds: int = 5
+    n_folds: int = 5,
+    max_per_class: int = None,
+    on_epoch_end=None
 ):
     """
     Train the taxonomic classifier with advanced techniques
+    
+    on_epoch_end(epoch, metrics) is called after every epoch (e.g. to log to MLflow)
     
     Features:
     - Data augmentation
@@ -360,7 +368,7 @@ def train_classifier(
     
     # Load data
     logger.info("Loading training data...")
-    sequences, labels, taxonomy_map = load_training_data(data_dir)
+    sequences, labels, taxonomy_map = load_training_data(data_dir, max_per_class=max_per_class)
     num_classes = len(set(labels))
     
     logger.info(f"Dataset Statistics:")
@@ -605,6 +613,11 @@ def train_classifier(
         train_history['val_acc'].append(val_acc)
         train_history['val_f1'].append(val_f1)
         train_history['learning_rate'].append(current_lr)
+        if on_epoch_end:
+            on_epoch_end(epoch, {
+                'train_loss': train_loss, 'train_acc': train_acc, 'val_loss': val_loss,
+                'val_acc': val_acc, 'val_f1': val_f1, 'learning_rate': current_lr,
+            })
         
         # Log metrics
         logger.info(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
@@ -655,15 +668,18 @@ def train_classifier(
     logger.info(f"Best Validation F1: {best_val_f1:.4f}")
     
     # Load best model for final evaluation
-    checkpoint = torch.load(os.path.join(output_dir, 'best_model.pth'))
+    checkpoint = torch.load(os.path.join(output_dir, 'best_model.pth'), map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     final_eval = evaluate_model(model, val_loader, device)
+    val_accuracy = float(final_eval['classification_report']['accuracy'])
     
     # Save results
     results = {
         'best_val_loss': best_val_loss,
         'best_val_f1': best_val_f1,
+        'val_accuracy': val_accuracy,
+        'best_epoch': int(checkpoint['epoch']) + 1,
         'final_evaluation': {
             'f1_score': final_eval['f1_score'],
             'classification_report': final_eval['classification_report']
@@ -700,6 +716,11 @@ def train_classifier(
         'num_conv_layers': num_conv_layers,
         'dropout': dropout,
         'max_sequence_length': 1000,
+        'model_version': datetime.now(timezone.utc).strftime('v%Y%m%d-%H%M'),
+        'training_dataset': Path(data_dir).name,
+        'trained_on': datetime.now(timezone.utc).date().isoformat(),
+        'best_epoch': int(checkpoint['epoch']) + 1,
+        'best_accuracy': val_accuracy,
     }
     with open(os.path.join(output_dir, 'model_config.json'), 'w') as f:
         json.dump(config, f, indent=2)
@@ -773,6 +794,48 @@ def train_novelty_detector(
     logger.info(f"Novelty detector saved to {model_path}")
 
 
+def train_with_mlflow(args, train_kwargs: Dict) -> Dict:
+    """
+    Train inside an MLflow run: log parameters, per-epoch metrics and plots, then register the
+    model as a new version aliased @challenger (optionally promoted to @champion by the gate)
+    """
+    import mlflow
+    from app.ml import registry
+
+    registry.configure(args.mlflow_tracking_uri)
+    mlflow.set_experiment(args.experiment)
+
+    with mlflow.start_run(run_name=f"train-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}") as run:
+        mlflow.set_tags({"source": "train_model.py", "dataset": Path(args.data_dir).name})
+        mlflow.log_params({k: v for k, v in train_kwargs.items() if k not in ('data_dir', 'output_dir')})
+
+        results = train_classifier(
+            **train_kwargs,
+            on_epoch_end=lambda epoch, metrics: mlflow.log_metrics(metrics, step=epoch),
+        )
+        mlflow.log_params({f"model.{k}": v for k, v in results['hyperparameters'].items()})
+        mlflow.log_metrics({
+            registry.GATE_METRIC: results['val_accuracy'],
+            'val_f1': results['best_val_f1'],
+            'best_val_loss': results['best_val_loss'],
+            'best_epoch': results['best_epoch'],
+        })
+        for artifact in ('training_curves.png', 'confusion_matrix.png', 'training_results.json'):
+            path = Path(args.output_dir) / artifact
+            if path.exists():
+                mlflow.log_artifact(str(path), artifact_path='reports')
+
+        version = registry.log_model_version(Path(args.output_dir), args.model_name, alias=registry.CHALLENGER)
+        logger.info(f"MLflow run {run.info.run_id}: registered {args.model_name} v{version.version} @challenger")
+
+    if args.promote:
+        promoted, message = registry.promote_if_better(args.model_name, version.version)
+        logger.info(f"Approval gate: {message}")
+
+    results['mlflow'] = {'run_id': run.info.run_id, 'model_version': version.version}
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Train eDNA Classification Models with Advanced Techniques',
@@ -814,16 +877,29 @@ def main():
                        help='Number of folds for cross-validation')
     parser.add_argument('--train_novelty', action='store_true',
                        help='Also train novelty detector')
-    
+    parser.add_argument('--max_per_class', type=int, default=None,
+                       help='Use at most N sequences per class (quick smoke-training runs)')
+
+    # MLflow tracking & registry (enabled when a tracking URI is given or MLFLOW_TRACKING_URI is set)
+    parser.add_argument('--mlflow_tracking_uri', type=str, default=os.getenv('MLFLOW_TRACKING_URI', ''),
+                       help='MLflow tracking server, e.g. http://localhost:5000')
+    parser.add_argument('--experiment', type=str,
+                       default=os.getenv('MLFLOW_EXPERIMENT', 'marine-edna-classification'),
+                       help='MLflow experiment name')
+    parser.add_argument('--model_name', type=str,
+                       default=os.getenv('MLFLOW_MODEL_NAME', 'marine-edna-classifier'),
+                       help='Registered model name')
+    parser.add_argument('--promote', action='store_true',
+                       help='Run the approval gate: make the new version @champion if it beats the current one')
+
     args = parser.parse_args()
-    
+
     # Log configuration
     logger.info("Configuration:")
     for arg, value in vars(args).items():
         logger.info(f"  {arg}: {value}")
-    
-    # Train classifier
-    results = train_classifier(
+
+    train_kwargs = dict(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         epochs=args.epochs,
@@ -836,8 +912,17 @@ def main():
         early_stopping_patience=args.early_stopping,
         tune_hyperparameters=args.tune_hyperparameters,
         use_cross_validation=args.cross_validation,
-        n_folds=args.n_folds
+        n_folds=args.n_folds,
+        max_per_class=args.max_per_class,
     )
+
+    # Train classifier (tracked in MLflow when configured)
+    if args.mlflow_tracking_uri and not args.cross_validation:
+        results = train_with_mlflow(args, train_kwargs)
+    else:
+        if args.mlflow_tracking_uri:
+            logger.warning("MLflow registration is skipped for cross-validation runs (no single final model)")
+        results = train_classifier(**train_kwargs)
     
     # Train novelty detector if requested
     if args.train_novelty:
@@ -857,185 +942,6 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("All Training Complete!")
     logger.info("=" * 80)
-
-
-if __name__ == '__main__':
-    main()
-
-
-
-def create_balanced_sampler(labels: List[int]) -> WeightedRandomSampler:
-    """
-    Create weighted sampler to handle class imbalance
-    """
-    class_counts = Counter(labels)
-    class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
-    sample_weights = [class_weights[label] for label in labels]
-    
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-    
-    return sampler
-
-
-def calculate_class_weights(labels: List[int], device: str) -> torch.Tensor:
-    """
-    Calculate class weights for imbalanced datasets
-    """
-    class_counts = Counter(labels)
-    total = len(labels)
-    num_classes = len(class_counts)
-    
-    weights = torch.zeros(num_classes)
-    for cls, count in class_counts.items():
-        weights[cls] = total / (num_classes * count)
-    
-    return weights.to(device)
-
-
-class EarlyStopping:
-    """
-    Early stopping to prevent overfitting
-    """
-    def __init__(self, patience: int = 10, min_delta: float = 0.0001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-        
-    def __call__(self, val_loss: float) -> bool:
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
-        
-        return self.early_stop
-
-
-def evaluate_model(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: str
-) -> Dict:
-    """
-    Comprehensive model evaluation
-    """
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_confidences = []
-    
-    with torch.no_grad():
-        for batch_sequences, batch_labels in dataloader:
-            batch_sequences = batch_sequences.to(device)
-            batch_labels = batch_labels.to(device)
-            
-            logits, confidence = model(batch_sequences)
-            _, predicted = torch.max(logits, 1)
-            
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(batch_labels.cpu().numpy())
-            all_confidences.extend(confidence.cpu().numpy())
-    
-    # Calculate metrics
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    
-    # Classification report
-    report = classification_report(
-        all_labels,
-        all_preds,
-        output_dict=True,
-        zero_division=0
-    )
-    
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    return {
-        'f1_score': f1,
-        'classification_report': report,
-        'confusion_matrix': cm.tolist(),
-        'predictions': all_preds,
-        'labels': all_labels,
-        'confidences': all_confidences
-    }
-
-
-def plot_training_history(history: Dict, output_dir: str):
-    """
-    Plot training curves
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Loss curves
-    axes[0, 0].plot(history['train_loss'], label='Train Loss')
-    axes[0, 0].plot(history['val_loss'], label='Val Loss')
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].set_ylabel('Loss')
-    axes[0, 0].set_title('Training and Validation Loss')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
-    
-    # Accuracy curves
-    axes[0, 1].plot(history['train_acc'], label='Train Acc')
-    axes[0, 1].plot(history['val_acc'], label='Val Acc')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].set_ylabel('Accuracy (%)')
-    axes[0, 1].set_title('Training and Validation Accuracy')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    # F1 Score
-    if 'val_f1' in history:
-        axes[1, 0].plot(history['val_f1'], label='Val F1')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('F1 Score')
-        axes[1, 0].set_title('Validation F1 Score')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True)
-    
-    # Learning rate
-    if 'learning_rate' in history:
-        axes[1, 1].plot(history['learning_rate'])
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Learning Rate')
-        axes[1, 1].set_title('Learning Rate Schedule')
-        axes[1, 1].set_yscale('log')
-        axes[1, 1].grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'training_curves.png'), dpi=300)
-    plt.close()
-
-
-def plot_confusion_matrix(cm: np.ndarray, output_dir: str, class_names: List[str] = None):
-    """
-    Plot confusion matrix
-    """
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=class_names if class_names else range(len(cm)),
-        yticklabels=class_names if class_names else range(len(cm))
-    )
-    plt.title('Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'), dpi=300)
-    plt.close()
 
 
 def hyperparameter_tuning(
@@ -1208,3 +1114,7 @@ def train_single_fold(
     # Implementation similar to train_classifier but for a single fold
     # Returns validation metrics
     pass  # Placeholder
+
+
+if __name__ == '__main__':
+    main()

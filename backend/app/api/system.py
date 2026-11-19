@@ -59,6 +59,13 @@ def detailed_health_check(
         model_loader=getattr(request.app.state, "model_loader", None),
         cache_manager=getattr(request.app.state, "cache_manager", None),
     )
+    model_info = getattr(request.app.state, "model_info", None) or {}
+    health["components"]["model"].update({
+        "source": model_info.get("source"),
+        "name": model_info.get("name"),
+        "version": model_info.get("version"),
+        "alias": model_info.get("alias"),
+    })
     db_ok = database_ok(db)
     health["components"]["database"] = {"status": "active" if db_ok else "error"}
     if not db_ok:

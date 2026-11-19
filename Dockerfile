@@ -34,7 +34,8 @@ EXPOSE 8000
 ENV PYTHONPATH=/app \
     MODEL_DIR=/app/ml_models \
     MODEL_DEVICE=cpu \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    GIT_PYTHON_REFRESH=quiet
 
 # Health check (stdlib only); /health returns 503 when the model or database is down
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

@@ -46,22 +46,32 @@ class ModelLoader:
             model_name: Name of the model directory
         """
         model_path = self.model_dir / model_name
-        
+
         if not model_path.exists():
             logger.error(f"Model not found: {model_path}")
             raise FileNotFoundError(f"Model {model_name} not found")
-        
+
+        self.load_from_files(
+            config_file=model_path / "model_config.json",
+            taxonomy_file=model_path / "taxonomy_map.json",
+            weights_file=model_path / "best_model.pth",
+            novelty_file=model_path / "novelty" / "novelty_detector.pth",
+        )
+        logger.info(f"Successfully loaded model: {model_name}")
+
+    def load_from_files(self, config_file, taxonomy_file, weights_file, novelty_file=None):
+        """
+        Load a model from explicit file paths (a local model folder or MLflow-downloaded artifacts)
+        """
         try:
             # Load model config
-            config_file = model_path / "model_config.json"
             with open(config_file, 'r') as f:
                 self.model_config = json.load(f)
-            
+
             # Load taxonomy mapping
-            taxonomy_file = model_path / "taxonomy_map.json"
             with open(taxonomy_file, 'r') as f:
                 self.taxonomy_map = json.load(f)
-            
+
             # Initialize classifier
             self.classifier = DeepTaxaClassifier(
                 num_classes=self.model_config['num_classes'],
@@ -72,23 +82,20 @@ class ModelLoader:
             )
             
             # Load weights
-            weights_file = model_path / "best_model.pth"
             checkpoint = torch.load(weights_file, map_location=self.device)
             self.classifier.load_state_dict(checkpoint['model_state_dict'])
             self.classifier.to(self.device)
             self.classifier.eval()
-            
+
             # Load novelty detector if available
-            novelty_path = model_path / "novelty" / "novelty_detector.pth"
-            if novelty_path.exists():
+            if novelty_file is not None and Path(novelty_file).exists():
                 self.novelty_detector = NovelTaxaDetector()
                 self.novelty_detector.load_state_dict(
-                    torch.load(novelty_path, map_location=self.device)
+                    torch.load(novelty_file, map_location=self.device)
                 )
                 self.novelty_detector.to(self.device)
                 self.novelty_detector.eval()
-            
-            logger.info(f"Successfully loaded model: {model_name}")
+
             logger.info(f"  Classes: {self.model_config['num_classes']}")
             logger.info(f"  Device: {self.device}")
             

@@ -1,3 +1,4 @@
+# Pull request summary. Tests, builds and the E2E stack run in ci-cd.yml, which also triggers on PRs.
 name: Pull Request Checks
 
 on:
@@ -5,186 +6,43 @@ on:
     branches: [main, develop]
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+
 jobs:
-  pr-info:
-    name: PR Information
+  pr-summary:
+    name: PR summary and size check
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get PR details
-        run: |
-          echo "# Pull Request Information" > pr-info.md
-          echo "" >> pr-info.md
-          echo "- **PR Number**: ${{ github.event.pull_request.number }}" >> pr-info.md
-          echo "- **Title**: ${{ github.event.pull_request.title }}" >> pr-info.md
-          echo "- **Author**: ${{ github.event.pull_request.user.login }}" >> pr-info.md
-          echo "- **Base Branch**: ${{ github.event.pull_request.base.ref }}" >> pr-info.md
-          echo "- **Head Branch**: ${{ github.event.pull_request.head.ref }}" >> pr-info.md
-
-      - name: Check file changes
-        run: |
-          echo "" >> pr-info.md
-          echo "## Files Changed" >> pr-info.md
-          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD >> pr-info.md
-
-      - name: Count lines changed
-        run: |
-          echo "" >> pr-info.md
-          echo "## Statistics" >> pr-info.md
-          git diff --shortstat origin/${{ github.event.pull_request.base.ref }}...HEAD >> pr-info.md
-
-      - name: Upload PR info
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-information
-          path: pr-info.md
-
-  lint-pr:
-    name: Lint PR Changes
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Install linting tools
-        run: |
-          pip install flake8 black isort pylint
-
-      - name: Run Black formatter check
-        run: |
-          black --check backend/app mlops/ --line-length=120 || \
-          echo "::warning::Code formatting issues found. Run 'black backend/app mlops/ --line-length=120' locally."
-
-      - name: Run isort check
-        run: |
-          isort --check-only backend/app mlops/ || \
-          echo "::warning::Import sorting issues found. Run 'isort backend/app mlops/' locally."
-
-      - name: Run Flake8
-        run: |
-          flake8 backend/app mlops/ --max-line-length=120 --ignore=E501,W503,E203 || \
-          echo "::warning::Linting issues found."
-
-  test-pr:
-    name: Test PR Changes
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          cd backend
-          pip install -r requirements.txt
-          pip install pytest pytest-cov
-
-      - name: Run tests
+      - name: Summarize changes
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          BASE: origin/${{ github.event.pull_request.base.ref }}
+          TITLE: ${{ github.event.pull_request.title }}
         run: |
-          cd backend
-          pytest tests/ -v --cov=app || echo "::error::Tests failed"
+          {
+            echo "## PR #${{ github.event.pull_request.number }}: $TITLE"
+            echo ""
+            echo "**Base:** \`${{ github.event.pull_request.base.ref }}\` · **Head:** \`${{ github.event.pull_request.head.ref }}\`"
+            echo ""
+            echo '```'
+            git diff --shortstat "$BASE"...HEAD
+            echo '```'
+            echo "<details><summary>Files changed</summary>"
+            echo ""
+            git diff --name-only "$BASE"...HEAD | sed 's/^/- /'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  check-dependencies:
-    name: Check Dependencies
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Check for dependency conflicts
+      - name: Warn on very large PRs
+        env:
+          BASE: origin/${{ github.event.pull_request.base.ref }}
         run: |
-          cd backend
-          pip install -r requirements.txt
-          pip check || echo "::warning::Dependency conflicts detected"
-
-      - name: Check for security vulnerabilities
-        run: |
-          pip install safety
-          cd backend
-          safety check -r requirements.txt || echo "::warning::Security vulnerabilities found"
-
-  size-check:
-    name: PR Size Check
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check PR size
-        run: |
-          CHANGES=$(git diff --shortstat origin/${{ github.event.pull_request.base.ref }}...HEAD | awk '{print $4+$6}')
-          echo "Total lines changed: $CHANGES"
-
-          if [ "$CHANGES" -gt 1000 ]; then
-            echo "::warning::This PR is very large ($CHANGES lines). Consider breaking it into smaller PRs."
+          changes=$(git diff --numstat "$BASE"...HEAD | awk '{s += $1 + $2} END {print s + 0}')
+          echo "Total lines changed: $changes"
+          if [ "$changes" -gt 1000 ]; then
+            echo "::warning::This PR changes $changes lines. Consider splitting it into smaller PRs."
           fi
-
-  comment-pr:
-    name: Comment on PR
-    runs-on: ubuntu-latest
-    needs: [lint-pr, test-pr, check-dependencies]
-    if: always()
-
-    steps:
-      - name: Create PR comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const lintStatus = '${{ needs.lint-pr.result }}';
-            const testStatus = '${{ needs.test-pr.result }}';
-            const depStatus = '${{ needs.check-dependencies.result }}';
-
-            let emoji = '✅';
-            let status = 'All checks passed!';
-
-            if (lintStatus !== 'success' || testStatus !== 'success' || depStatus !== 'success') {
-              emoji = '⚠️';
-              status = 'Some checks failed or have warnings.';
-            }
-
-            const body = `
-            ## ${emoji} PR Check Results
-
-            ${status}
-
-            - Linting: ${lintStatus === 'success' ? '✅' : '❌'}
-            - Tests: ${testStatus === 'success' ? '✅' : '❌'}
-            - Dependencies: ${depStatus === 'success' ? '✅' : '❌'}
-
-            ---
-            *Automated comment by GitHub Actions*
-            `;
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });

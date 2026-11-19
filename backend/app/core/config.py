@@ -54,10 +54,20 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE: int = 524288000  # 500MB
 
     # Deep Learning
-    DEFAULT_MODEL: str = "marine_model"  # Use the trained marine model
+    DEFAULT_MODEL: str = "marine_model"  # Bundled model folder inside MODEL_DIR
     MODEL_DEVICE: str = "cpu"  # "cuda" falls back to cpu if no GPU is available
     BATCH_SIZE: int = 32
     MAX_SEQUENCE_LENGTH: int = 1000
+
+    # Model source: "mlflow" (registry only, fail if unavailable), "local" (bundled files)
+    # or "auto" (MLflow when MLFLOW_TRACKING_URI is set, otherwise/fallback local)
+    MODEL_SOURCE: str = "auto"
+
+    # MLflow (inside Docker use the service name or host.docker.internal, never localhost)
+    MLFLOW_TRACKING_URI: str = ""
+    MLFLOW_EXPERIMENT: str = "marine-edna-classification"
+    MLFLOW_MODEL_NAME: str = "marine-edna-classifier"
+    MLFLOW_MODEL_ALIAS: str = "champion"
 
     # Security
     SECRET_KEY: str = DEFAULT_SECRET_KEY

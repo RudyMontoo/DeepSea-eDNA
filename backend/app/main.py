@@ -1,4 +1,3 @@
-import json
 import logging
 import sys
 import time
@@ -15,7 +14,7 @@ from app.api import analysis, auth, experiments, export, me, models, oauth, syst
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.db.session import run_migrations
-from app.services.model_loader import ModelLoader
+from app.services.serving import load_serving_model, sync_version_registry
 from mlops.ab_testing import ABTestManager
 from mlops.cache_manager import CacheManager
 from mlops.model_versioning import ModelVersionRegistry
@@ -30,29 +29,6 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "strict-origin-when-cross-origin",
 }
-
-
-def register_baseline_version(registry: ModelVersionRegistry):
-    """Register the bundled model as the current version on first start"""
-    model_path = Path(settings.MODEL_DIR) / settings.DEFAULT_MODEL
-    config_file = model_path / "model_config.json"
-    if not config_file.exists():
-        return
-    config = json.loads(config_file.read_text())
-    registry.register_version(
-        version_name=config.get("model_version", "v1"),
-        model_path=str(model_path),
-        description="Bundled baseline model",
-        metrics={"accuracy": config["best_accuracy"]} if "best_accuracy" in config else {},
-        training_info={
-            "dataset": config.get("training_dataset"),
-            "best_epoch": config.get("best_epoch"),
-            "num_classes": config.get("num_classes"),
-        },
-        tags=["baseline", settings.DEFAULT_MODEL],
-        set_as_current=True,
-    )
-    logger.info("Registered bundled model as baseline version")
 
 
 @asynccontextmanager
@@ -71,16 +47,16 @@ async def lifespan(app: FastAPI):
     app.state.monitoring_manager = MonitoringManager()
 
     version_registry = ModelVersionRegistry(registry_path=str(state_dir / "registry.json"))
-    if not version_registry.versions:
-        register_baseline_version(version_registry)
     app.state.version_registry = version_registry
 
     app.state.ab_test_manager = ABTestManager(experiments_path=str(state_dir / "experiments.json"))
 
-    model_loader = ModelLoader()
-    await model_loader.load_default_model()
+    # The model comes from the MLflow registry (models:/<name>@<alias>) or the bundled files
+    model_loader, model_info = load_serving_model()
     app.state.model_loader = model_loader
-    app.state.monitoring_manager.set_model_status(settings.DEFAULT_MODEL, model_loader.is_loaded())
+    app.state.model_info = model_info
+    sync_version_registry(version_registry, model_info)
+    app.state.monitoring_manager.set_model_status(model_info["name"], model_loader.is_loaded())
 
     app.state.cache_manager = CacheManager()
     logger.info(f"Cache backend: {app.state.cache_manager.backend}")
@@ -89,7 +65,7 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Shutting down application...")
-    model_loader.cleanup()
+    app.state.model_loader.cleanup()
     app.state.cache_manager.close()
 
 

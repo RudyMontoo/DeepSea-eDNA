@@ -16,6 +16,10 @@ SQLAlchemy>=2.0.36
 alembic>=1.14.0
 psycopg[binary]>=3.2.3
 
+# MLflow client: experiment tracking + model registry
+# (pinned to the same version as the tracking server image in docker-compose.yml)
+mlflow-skinny==3.17.2
+
 # Deep Learning
 torch>=2.0.0
 numpy>=1.24.0

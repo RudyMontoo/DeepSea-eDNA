@@ -21,6 +21,7 @@ import { ErrorState } from '@/components/ui/ErrorState';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { ServingModelCard } from '@/components/models/ServingModelCard';
 import type { ModelVersion } from '@/types/api';
 
 function versionStatusTone(status: string): BadgeTone {
@@ -240,6 +241,7 @@ export function ModelsPage() {
 
   return (
     <div className="space-y-6">
+      <ServingModelCard canManage={canWrite} />
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>

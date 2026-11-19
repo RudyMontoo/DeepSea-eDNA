@@ -1,0 +1,4 @@
+# Extra packages for train_model.py (on top of ../requirements.txt)
+optuna>=3.6.0
+matplotlib>=3.8.0
+seaborn>=0.13.0

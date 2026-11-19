@@ -15,6 +15,7 @@ import type {
   OAuthProvider,
   PaginatedResponse,
   PredictionHistoryItem,
+  ServingModelInfo,
   UserUpdateRequest,
   BatchPredictResponse,
   CacheClearResponse,
@@ -617,6 +618,17 @@ export const api = {
     const match = disposition?.match(/filename="?([^"]+)"?/i);
     const filename = match?.[1] || `deepsea_edna_${jobId}.${format}`;
     return { blob: res.data, filename };
+  },
+
+  // Model serving (MLflow registry champion or bundled files)
+  async getServingModel(): Promise<ServingModelInfo> {
+    const res = await httpClient.get<ServingModelInfo>('/api/model/serving');
+    return res.data;
+  },
+
+  async reloadServingModel(): Promise<ServingModelInfo> {
+    const res = await httpClient.post<ServingModelInfo>('/api/model/reload', null, { timeout: 120000 });
+    return res.data;
   },
 
   // Model Registry & Versions

@@ -2,34 +2,13 @@
 Integration tests for the DeepSea eDNA API
 Run from backend/: pytest tests -v
 """
-import os
-import sys
-import tempfile
 import uuid
-from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-
-# Isolated settings must be in place before the app is imported
-_TMP = Path(tempfile.mkdtemp(prefix="deepsea-test-"))
-os.environ.update({
-    # SQLite by default; set TEST_DATABASE_URL to run the suite against PostgreSQL
-    "DATABASE_URL": os.environ.get("TEST_DATABASE_URL", f"sqlite:///{(_TMP / 'test.db').as_posix()}"),
-    "STATE_DIR": str(_TMP / "state"),
-    "UPLOAD_DIR": str(_TMP / "uploads"),
-    "ADMIN_EMAILS": "admin@example.com",
-    "SECRET_KEY": "test-secret-key-for-the-integration-suite-0123456789",
-    "LOGIN_RATE_LIMIT_PER_MINUTE": "1000",
-    "GITHUB_CLIENT_ID": "test-client",
-    "GITHUB_CLIENT_SECRET": "test-secret",
-    "FRONTEND_URL": "http://frontend.test",
-})
-os.environ.pop("REDIS_URL", None)
 
 import pytest
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+# Environment isolation lives in conftest.py
 from app.api import oauth
 from app.core.rate_limit import RateLimiter
 from app.main import app
@@ -316,6 +295,21 @@ class TestGitHubOAuth:
 
     def test_unconfigured_provider_404(self):
         assert client.get("/auth/oauth/google/login", follow_redirects=False).status_code == 404
+
+
+class TestModelServing:
+    def test_serving_info(self, viewer):
+        info = client.get("/api/model/serving", headers=headers(viewer["tokens"])).json()
+        assert info["source"] == "local" and info["version"] == "v2.1"
+        assert info["mlflow_enabled"] is False
+
+    def test_served_model_is_current_registry_version(self, viewer):
+        current = client.get("/versions/current/info", headers=headers(viewer["tokens"])).json()
+        assert current["version_name"] == "v2.1" and "local" in current["tags"]
+
+    def test_reload_requires_mlflow_and_permission(self, admin, viewer):
+        assert client.post("/api/model/reload", headers=headers(viewer["tokens"])).status_code == 403
+        assert client.post("/api/model/reload", headers=headers(admin["tokens"])).status_code == 409
 
 
 class TestSystem:

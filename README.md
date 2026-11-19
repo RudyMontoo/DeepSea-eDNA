@@ -49,7 +49,7 @@
 DeepSea eDNA AI is a comprehensive machine learning operations platform that provides:
 
 - **94.18% Accuracy** on 8 marine species classification
-- **100+ API Endpoints** for complete ML lifecycle management
+- **54 API endpoints** for the complete ML lifecycle
 - **Enterprise Security** with JWT authentication and RBAC
 - **Real-time Monitoring** with Prometheus metrics
 - **Model Versioning** and A/B testing capabilities
@@ -97,10 +97,11 @@ Environmental DNA (eDNA) is genetic material obtained from environmental samples
 
 ### 🚀 CI/CD & Deployment
 
-- ✅ **GitHub Actions** - Automated testing on every PR
-- ✅ **Docker Publishing** - Auto-build and push to GHCR
-- ✅ **Multi-stage Builds** - Optimized image size
-- ✅ **One-Command Deploy** - Simplified deployment process
+- ✅ **CI/CD pipeline** (`ci-cd.yml`) - lint, backend tests on SQLite + PostgreSQL, frontend build,
+  then a full docker compose E2E run (model served from MLflow) before anything is published
+- ✅ **Container registry** - the exact images that passed E2E are pushed to GHCR from `main` and `v*` tags
+- ✅ **MLflow model registry** - experiment tracking, versioned models, `@champion`/`@challenger` aliases
+- ✅ **Retraining pipeline** (`model-training.yml`) - train, register, approval gate, manual or event-triggered
 
 ---
 
@@ -210,9 +211,8 @@ Access at: http://localhost:8000/api/docs
 #### First Steps
 
 1. **Access API Docs**: http://localhost:8000/api/docs
-2. **Login** (default credentials):
-   - Username: `admin`
-   - Password: `admin123`
+2. **Sign in**: register (or use Google/GitHub) with an email listed in `ADMIN_EMAILS` to get the
+   admin role, then get a token from `POST /auth/token`
 3. **Make Prediction**:
 
 ```bash
@@ -223,6 +223,97 @@ curl -X POST "http://localhost:8000/api/predict" \
 ```
 
 ---
+
+## 🔁 MLflow Model Registry & Serving
+
+The API no longer loads a hand-picked weights file: it serves whichever model version holds the
+**`@champion`** alias in the MLflow Model Registry.
+
+```text
+ train_model.py ──> MLflow tracking ──> Model Registry: marine-edna-classifier
+ (params, per-epoch       (runs)            v1 @champion   v2 @challenger ...
+  metrics, plots)                                   │
+                                    approval gate ──┘ (promote only if val_accuracy beats the champion)
+                                                    │
+                              models:/marine-edna-classifier@champion
+                                                    │
+ client ──> FastAPI container (port 8000) ── loads ─┘ via MLflow tracking server (port 5000)
+```
+
+### With docker compose (recommended)
+
+`docker compose up -d --build` starts an MLflow server (UI at http://localhost:5000) and a one-shot
+`model-init` job that registers the bundled, already-trained model as **v1 @champion** (only if no
+champion exists yet). The backend then loads `models:/marine-edna-classifier@champion` with
+`MODEL_SOURCE=mlflow`, so it fails fast instead of silently serving something else.
+
+Model files are **proxied by the tracking server** (`--artifacts-destination`), so the API container
+only needs the tracking URI, not direct access to the artifact store.
+
+### Networking: localhost vs `host.docker.internal`
+
+Inside a container, `localhost` is the container itself. Inside the compose network the backend
+reaches MLflow by service name, `http://mlflow:5000`. A standalone container talking to an MLflow
+server on your **host** must use `host.docker.internal` (Docker Desktop on Windows/macOS; on Linux add
+`--add-host=host.docker.internal:host-gateway`):
+
+```bash
+# MLflow on the host. MLflow 3.5+ rejects unknown Host headers, so allow the Docker hostname:
+mlflow server --host 0.0.0.0 --port 5000 --allowed-hosts "localhost:5000,host.docker.internal:5000"
+
+docker build -t deepsea-edna-api:v2 .
+docker run --rm -e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 deepsea-edna-api:v2 python -m app.ml.cli bootstrap
+docker run -d --name ml-api -p 8000:8000 -e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 -e MODEL_SOURCE=mlflow deepsea-edna-api:v2
+```
+
+MLflow (5000) and FastAPI (8000) are independent ports: `MLFLOW_TRACKING_URI` points at MLflow,
+`-p 8000:8000` publishes the API.
+
+### Train, register, promote, reload
+
+```bash
+cd backend
+pip install -r requirements.txt -r training/requirements.txt
+export MLFLOW_TRACKING_URI=http://localhost:5000
+
+# Logs params, per-epoch metrics, plots; registers a new version as @challenger;
+# --promote runs the approval gate (champion only if val_accuracy beats the current one)
+python training/train_model.py --data_dir ../data/training/marine_diverse --output_dir ./out --epochs 50 --promote
+
+python -m app.ml.cli info                    # current @champion and @challenger
+python -m app.ml.cli promote --version 3     # manual approval through the same gate
+```
+
+After a new champion is promoted, click **Reload @champion** on the Model Registry page (or
+`POST /api/model/reload`) to switch the live API without a restart. Prediction cache keys include
+the model version, so old cached results are never served for a new model.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `MODEL_SOURCE` | `auto` | `mlflow` = registry only, `local` = bundled files, `auto` = registry if configured, else bundled |
+| `MLFLOW_TRACKING_URI` | _(empty)_ | e.g. `http://mlflow:5000` (compose), `http://host.docker.internal:5000` |
+| `MLFLOW_MODEL_NAME` | `marine-edna-classifier` | Registered model name |
+| `MLFLOW_MODEL_ALIAS` | `champion` | Alias the API serves |
+
+## 🔄 CI/CD Pipeline
+
+| Workflow | Trigger | What it does |
+| --- | --- | --- |
+| `ci-cd.yml` | push, pull request | Lint → backend tests (SQLite + PostgreSQL, incl. MLflow) + frontend build → **E2E**: full `docker compose` stack, smoke test asserting the model is served from MLflow, restart-idempotency check → on `main`/`v*` tags, **publish the tested images** to `ghcr.io/<owner>/<repo>` and `-web` |
+| `model-training.yml` | manual, or `repository_dispatch: retrain` | Train → log to MLflow → register `@challenger` → approval gate → `@champion` |
+| `pr-checks.yml` | pull request | Change summary and size warning |
+
+The retraining workflow uses the repository secret `MLFLOW_TRACKING_URI` when set (a tracking server
+reachable from GitHub); otherwise it trains against a throwaway MLflow store and uploads it as an
+artifact. GitHub-hosted runners are CPU-only, so the default is a quick subsampled run; full training
+belongs on a GPU or self-hosted runner. The `retrain` event is the hook for automated triggers such
+as drift detection:
+
+```bash
+curl -X POST -H "Authorization: Bearer <token>" https://api.github.com/repos/<owner>/<repo>/dispatches   -d '{"event_type": "retrain", "client_payload": {"epochs": 20, "max_per_class": ""}}'
+```
+
+Optional repository variable `PUBLIC_API_URL` sets the API URL baked into the published frontend image.
 
 ## 📚 API Documentation
 
@@ -373,14 +464,10 @@ GET /cache/backend
 Authorization: Bearer <token>
 ```
 
-### Default Credentials
+### First Admin
 
-**Admin Account:**
-
-- Username: `admin`
-- Password: `admin123`
-
-⚠️ **Change immediately in production!**
+There is no default account. Put your email in `ADMIN_EMAILS` (in `.env`), then register or sign in
+with Google/GitHub using that email: the account becomes `admin`. Everyone else starts as `viewer`.
 
 ### Roles & Permissions
 
@@ -480,7 +567,7 @@ The model classifies 8 marine taxa:
 - **Validation Split**: 20%
 - **Test Accuracy**: 94.18%
 - **Model Architecture**: Deep Neural Network with attention mechanism
-- **Model Size**: ~3.3 GB (including PyTorch weights)
+- **Model Size**: 15 MB of PyTorch weights (API image ~0.6 GB with CPU-only PyTorch)
 - **Inference Time**: <100ms per sequence (cached)
 - **Batch Processing**: Up to 1000 sequences per request
 - **Device**: CPU-optimized (no GPU required for inference)
@@ -499,57 +586,27 @@ The model classifies 8 marine taxa:
 
 ### Run Tests
 
+The suite (46 tests) covers authentication, RBAC, per-user data isolation, OAuth (mocked providers),
+uploads/exports, and the MLflow registry: bootstrap, champion loading, the approval gate and hot reload.
+MLflow tests use a throwaway SQLite-backed store, so no server is needed.
+
 ```bash
-# Activate virtual environment
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+cd backend
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+python -m pytest tests -v
 
-# Run all tests
-pytest backend/tests/
-
-# Run with coverage report
-pytest backend/tests/ --cov=backend --cov-report=html
-
-# Run specific test file
-pytest backend/tests/test_integration.py
-
-# Run tests with verbose output
-pytest backend/tests/ -v
-
-# Run only unit tests
-pytest backend/tests/ -m unit
-
-# Run only integration tests
-pytest backend/tests/ -m integration
+# Against PostgreSQL instead of SQLite
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/test python -m pytest tests -v
 ```
 
-### Feature Tests
+Smoke-test a running deployment end to end (stdlib only):
 
-PowerShell scripts for testing individual features:
-
-```powershell
-# Test security features (JWT, RBAC, API keys)
-.\mlops\test_security.ps1
-
-# Test model versioning
-.\mlops\test_versioning.ps1
-
-# Test A/B testing functionality
-.\mlops\test_ab_testing.ps1
-
-# Test monitoring and metrics
-.\mlops\test_monitoring.ps1
-
-# Test caching layer
-.\mlops\test_cache.ps1
+```bash
+python scripts/smoke_test.py --api http://localhost:8000 --mlflow http://localhost:5000 --expect-source mlflow
 ```
 
-### Test Coverage
-
-Current test coverage: **85%+**
-
-- Unit tests: Authentication, Models, Services
-- Integration tests: API endpoints, Database operations
-- End-to-end tests: Complete workflows
+CI runs all of this on every push and pull request (see [CI/CD](#-cicd-pipeline)).
 
 ---
 
@@ -903,15 +960,14 @@ Future enhancements being considered:
 - [ ] Grafana dashboard templates
 - [ ] Mobile app (React Native)
 - [ ] Advanced visualization tools
-- [ ] Automated model retraining pipeline
 - [ ] Extended species database (>100 species)
 
 ### 📊 Statistics
 
-- **100+ API Endpoints**
+- **54 API Endpoints**
 - **94.18% Model Accuracy**
-- **85%+ Test Coverage**
-- **3.3 GB Model Size**
+- **46 Automated Tests** (SQLite + PostgreSQL in CI)
+- **15 MB Model Weights** (~0.6 GB CPU-only API image)
 - **50,000+ Training Sequences**
 - **8 Marine Taxa Classes**
 - **15/15 Features Complete**

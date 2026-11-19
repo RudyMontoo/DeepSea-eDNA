@@ -278,6 +278,20 @@ export interface AnalysisJobResponse {
 
 export type ExportFormat = 'json' | 'csv' | 'tsv' | 'biom' | 'fasta';
 
+export interface ServingModelInfo {
+  source: 'mlflow' | 'local' | string;
+  uri: string;
+  name: string;
+  alias: string | null;
+  version: string;
+  run_id: string | null;
+  metrics: Record<string, number>;
+  tracking_uri?: string;
+  loaded_at?: string;
+  mlflow_enabled: boolean;
+  previous_version?: string;
+}
+
 export interface ModelVersion {
   version_id: string;
   version_name: string;
