@@ -1,30 +1,32 @@
 """
-Analysis API endpoints
+Analysis API endpoints (file-based classification jobs, persisted per user)
 """
 import logging
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
-import asyncio
+from typing import Any, Dict, List, Optional
 
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_current_user, require_permission
+from app.api.upload import resolve_upload
+from app.core.security import Permission, UserRole, utcnow
+from app.db.models import AnalysisJob, User
+from app.db.session import SessionLocal, get_db
+from app.services.model_loader import NOVELTY_THRESHOLD, ModelLoader
 from app.services.sequence_processor import SequenceProcessor, TaxonomyMapper
-from app.services.model_loader import ModelLoader
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# In-memory job storage (use Redis in production)
-jobs: Dict[str, Dict[str, Any]] = {}
-
 
 class AnalysisRequest(BaseModel):
-    file_paths: list[str]
-    model: Optional[str] = None
-    clustering: Optional[str] = None
-    parameters: Optional[Dict[str, Any]] = None
+    file_paths: List[str] = Field(..., min_length=1, max_length=20)  # file IDs returned by /upload
 
 
 class AnalysisResponse(BaseModel):
@@ -36,200 +38,162 @@ class AnalysisResponse(BaseModel):
     error: Optional[str] = None
 
 
-async def process_analysis(
-    job_id: str,
-    file_paths: list[str],
-    model_loader: ModelLoader
-):
+def update_job(db: Session, job: AnalysisJob, **fields):
+    for key, value in fields.items():
+        setattr(job, key, value)
+    db.commit()
+
+
+def run_analysis(job_id: str, file_paths: List[Path], model_loader: ModelLoader):
     """
-    Background task to process analysis
+    Background task: preprocess, classify and summarise the uploaded files
     """
+    started = time.perf_counter()
+    db = SessionLocal()
+    job = db.get(AnalysisJob, job_id)
     try:
-        jobs[job_id]['status'] = 'processing'
-        jobs[job_id]['progress'] = 0
-        
-        # Step 1: Preprocessing
-        jobs[job_id]['currentStep'] = 'preprocessing'
-        jobs[job_id]['progress'] = 10
-        
+        update_job(db, job, status='processing', current_step='preprocessing', progress=10)
+
         processor = SequenceProcessor()
         all_sequences = []
         all_abundances = {}
-        
         for file_path in file_paths:
-            sequences, abundance, stats = processor.process_pipeline(file_path)
+            sequences, abundance, _ = processor.process_pipeline(str(file_path))
             all_sequences.extend(sequences)
-            all_abundances.update(abundance)
-        
-        logger.info(f"Processed {len(all_sequences)} sequences")
-        
-        # Step 2: Deep Learning Embedding
-        jobs[job_id]['currentStep'] = 'embedding'
-        jobs[job_id]['progress'] = 30
-        await asyncio.sleep(0.1)  # Allow event loop to process
-        
-        # Step 3: Classification
-        jobs[job_id]['currentStep'] = 'classification'
-        jobs[job_id]['progress'] = 50
-        
-        # Convert SeqRecord to strings
+            for seq_str, count in abundance.items():
+                all_abundances[seq_str] = all_abundances.get(seq_str, 0) + count
+
+        logger.info(f"Job {job_id}: {len(all_sequences)} sequences after preprocessing")
+        if not all_sequences:
+            raise ValueError(
+                f"No sequences passed quality filtering "
+                f"(length must be {processor.min_length}-{processor.max_length} bp)"
+            )
+
+        update_job(db, job, current_step='classification', progress=40)
         sequence_strings = [str(seq.seq) for seq in all_sequences]
-        
-        # Predict taxonomy
         predictions = model_loader.predict(sequence_strings)
-        
-        # Step 4: Abundance Estimation
-        jobs[job_id]['currentStep'] = 'abundance'
-        jobs[job_id]['progress'] = 70
-        
+
+        update_job(db, job, current_step='abundance', progress=75)
+
         # Aggregate results by taxon
         taxon_data = {}
         for i, pred in enumerate(predictions):
-            taxon_name = pred['taxon_name']
-            seq_str = str(all_sequences[i].seq)
-            abundance = all_abundances.get(seq_str, 1)
-            
-            if taxon_name not in taxon_data:
-                taxon_data[taxon_name] = {
-                    'name': taxon_name,
-                    'abundance': 0,
-                    'confidence': [],
-                    'is_novel': pred['is_novel'],
-                    'rank': pred['rank'],
-                    'lineage': pred['lineage']
-                }
-            
-            taxon_data[taxon_name]['abundance'] += abundance
-            taxon_data[taxon_name]['confidence'].append(pred['confidence'])
-        
-        # Calculate average confidence
-        taxonomic_data = []
-        for taxon_name, data in taxon_data.items():
-            avg_confidence = sum(data['confidence']) / len(data['confidence'])
-            taxonomic_data.append({
-                'name': data['name'],
-                'abundance': data['abundance'],
-                'confidence': avg_confidence,
-                'isNovel': data['is_novel'],
-                'taxonomicRank': data['rank'],
-                'lineage': data['lineage']
+            entry = taxon_data.setdefault(pred['taxon_name'], {
+                'abundance': 0, 'confidence': [], 'rank': pred['rank'], 'lineage': pred['lineage'],
             })
-        
-        # Sort by abundance
-        taxonomic_data.sort(key=lambda x: x['abundance'], reverse=True)
-        
-        # Step 5: Diversity Calculation
-        jobs[job_id]['currentStep'] = 'annotation'
-        jobs[job_id]['progress'] = 90
-        
-        taxonomy_mapper = TaxonomyMapper()
-        abundance_dict = {t['name']: t['abundance'] for t in taxonomic_data}
-        diversity_indices = taxonomy_mapper.calculate_diversity_indices(abundance_dict)
-        
-        # Generate depth profile (simulated based on diversity metrics)
-        # Note: Real depth data would require metadata from sampling locations
-        depth_profile = [
+            entry['abundance'] += all_abundances.get(sequence_strings[i], 1)
+            entry['confidence'].append(pred['confidence'])
+
+        taxonomic_data = sorted(
+            (
+                {
+                    'name': name,
+                    'abundance': data['abundance'],
+                    'confidence': sum(data['confidence']) / len(data['confidence']),
+                    'isNovel': sum(data['confidence']) / len(data['confidence']) < NOVELTY_THRESHOLD,
+                    'taxonomicRank': data['rank'],
+                    'lineage': data['lineage'],
+                }
+                for name, data in taxon_data.items()
+            ),
+            key=lambda t: t['abundance'],
+            reverse=True,
+        )
+
+        # Per-sequence rows (used by the results table and FASTA export)
+        sequence_rows = [
             {
-                'depth': 1000 + i * 500,
-                'diversity': diversity_indices['shannon'] * (1 - i * 0.08),
-                'abundance': sum(abundance_dict.values()) * (1 - i * 0.1) / 10
+                'sequence_id': all_sequences[i].id,
+                'predicted_taxon': pred['taxon_name'],
+                'confidence': pred['confidence'],
+                'abundance': all_abundances.get(sequence_strings[i], 1),
+                'is_novel': pred['is_novel'],
+                'rank': pred['rank'],
+                'lineage': pred['lineage'],
             }
-            for i in range(10)
+            for i, pred in enumerate(predictions)
         ]
-        
-        # Final results
+
+        update_job(db, job, current_step='annotation', progress=90)
+        diversity = TaxonomyMapper().calculate_diversity_indices({t['name']: t['abundance'] for t in taxonomic_data})
+
         results = {
             'totalSequences': len(all_sequences),
             'identifiedTaxa': len(taxonomic_data),
             'novelTaxa': sum(1 for t in taxonomic_data if t['isNovel']),
-            'shannonDiversity': diversity_indices['shannon'],
-            'simpsonDiversity': diversity_indices['simpson'],
+            'shannonDiversity': diversity['shannon'],
+            'simpsonDiversity': diversity['simpson'],
+            'evenness': diversity['evenness'],
             'taxonomicData': taxonomic_data,
-            'depthProfile': depth_profile,
+            'predictions': sequence_rows,
             'metadata': {
-                'processingTime': 0,
-                'model': 'DeepTaxa-v2.1',
-                'clustering': 'UMAP + DBSCAN',
-                'timestamp': ''
-            }
+                'processingTime': round(time.perf_counter() - started, 3),
+                'model': f"DeepTaxa-{model_loader.model_config.get('model_version', 'v2.1')}",
+                'clustering': 'Exact-match dereplication',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+            },
         }
-        
-        jobs[job_id]['status'] = 'completed'
-        jobs[job_id]['progress'] = 100
-        jobs[job_id]['results'] = results
-        
-        logger.info(f"Analysis {job_id} completed successfully")
-        
+        update_job(
+            db, job, status='completed', progress=100, current_step=None,
+            results=results, sequences=sequence_strings, completed_at=utcnow(),
+        )
+        logger.info(f"Analysis {job_id} completed")
+
     except Exception as e:
         logger.error(f"Analysis {job_id} failed: {e}")
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = str(e)
+        db.rollback()
+        update_job(db, job, status='failed', error=str(e), completed_at=utcnow())
+    finally:
+        db.close()
+
+
+def get_owned_job(db: Session, job_id: str, user: User) -> AnalysisJob:
+    """Jobs are private: other users get 404, as if the job did not exist"""
+    job = db.get(AnalysisJob, job_id)
+    if job is None or (job.user_id != user.id and user.role != UserRole.ADMIN.value):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @router.post("/analyze", response_model=AnalysisResponse)
-async def start_analysis(
+def start_analysis(
     request: AnalysisRequest,
     background_tasks: BackgroundTasks,
-    req: Request
+    req: Request,
+    user: User = Depends(require_permission(Permission.PREDICT_BATCH)),
+    db: Session = Depends(get_db),
 ):
     """
-    Start analysis job
+    Start an analysis job over files previously uploaded by the same user
     """
-    # Generate job ID
-    job_id = str(uuid.uuid4())
-    
-    # Validate file paths
-    if not request.file_paths:
-        raise HTTPException(status_code=400, detail="No files provided")
-    
-    # Validate files exist
-    for file_path in request.file_paths:
-        if not Path(file_path).exists():
-            raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-    
-    # Initialize job
-    jobs[job_id] = {
-        'status': 'queued',
-        'progress': 0,
-        'currentStep': None,
-        'results': None,
-        'error': None
-    }
-    
-    # Get model loader from app state
-    model_loader = req.app.state.model_loader
-    
-    # Start background processing
-    background_tasks.add_task(
-        process_analysis,
-        job_id,
-        request.file_paths,
-        model_loader
+    paths = [resolve_upload(user, file_id) for file_id in request.file_paths]
+    job = AnalysisJob(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        filenames=[p.name.split("_", 1)[-1] for p in paths],
+        status='queued',
+        progress=0,
     )
-    
-    logger.info(f"Started analysis job {job_id} with {len(request.file_paths)} files")
-    
-    return AnalysisResponse(
-        jobId=job_id,
-        status='queued'
-    )
+    db.add(job)
+    db.commit()
+
+    background_tasks.add_task(run_analysis, job.id, paths, req.app.state.model_loader)
+    logger.info(f"User {user.id} started analysis job {job.id} with {len(paths)} files")
+    return AnalysisResponse(jobId=job.id, status='queued', progress=0)
 
 
 @router.get("/results/{job_id}", response_model=AnalysisResponse)
-async def get_results(job_id: str):
+def get_results(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Get analysis results
+    Get analysis status and results
     """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
-    
+    job = get_owned_job(db, job_id, user)
     return AnalysisResponse(
-        jobId=job_id,
-        status=job['status'],
-        progress=job.get('progress'),
-        currentStep=job.get('currentStep'),
-        results=job.get('results'),
-        error=job.get('error')
+        jobId=job.id,
+        status=job.status,
+        progress=job.progress,
+        currentStep=job.current_step,
+        results=job.results,
+        error=job.error,
     )

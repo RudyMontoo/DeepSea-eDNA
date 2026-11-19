@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import hashlib
+import uuid
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
@@ -161,7 +162,7 @@ class ABTestManager:
             raise ValueError(f"Traffic percentages must sum to 100, got {total_traffic}")
         
         # Generate experiment ID
-        experiment_id = f"exp_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        experiment_id = f"exp_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         
         # Create variants
         variants = []

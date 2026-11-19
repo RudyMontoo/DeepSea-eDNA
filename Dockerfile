@@ -1,44 +1,45 @@
-# Multi-stage Dockerfile for DeepSea eDNA API
-FROM python:3.11-slim as base
+# Backend image for the DeepSea eDNA API
+FROM python:3.11-slim
 
-# Set working directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (for better caching)
 COPY backend/requirements.txt .
 
-# Install Python dependencies
+# Install CPU-only PyTorch first (the default CUDA build makes the image ~10GB)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install Python dependencies (all ship prebuilt wheels, so no compiler is needed)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy backend application code
+# Application code, MLOps modules and the trained model
 COPY backend/app ./app
+COPY backend/alembic.ini ./alembic.ini
 COPY backend/__init__.py .
-
-# Copy MLOps modules
 COPY mlops ./mlops
-
-# Copy ML models
 COPY ml_models ./ml_models
 
-# Create necessary directories
-RUN mkdir -p /app/data/uploads /app/logs
+# Run as an unprivileged user; /app/data holds the database file (SQLite mode),
+# uploads and registry state, and should be mounted as a volume
+RUN useradd --create-home --uid 1000 appuser \
+    && mkdir -p /app/data/uploads /app/data/state /app/logs \
+    && chown -R appuser:appuser /app/data /app/logs
+USER appuser
 
-# Expose port
 EXPOSE 8000
 
-# Environment variables
-ENV PYTHONPATH=/app
-ENV MODEL_DIR=/app/ml_models/marine_model
-ENV LOG_LEVEL=INFO
+ENV PYTHONPATH=/app \
+    MODEL_DIR=/app/ml_models \
+    MODEL_DEVICE=cpu \
+    LOG_LEVEL=INFO
 
-# Health check
+# Health check (stdlib only); /health returns 503 when the model or database is down
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=5)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"
 
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# Single worker: migrations run at startup and the A/B/registry state lives in process.
+# --proxy-headers lets rate limiting see real client IPs behind a reverse proxy.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers"]

@@ -13,14 +13,20 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Predictions whose top-class probability falls below this are flagged as potentially novel
+NOVELTY_THRESHOLD = 0.7
+
 
 class ModelLoader:
     """
     Load and manage deep learning models
     """
-    
+
     def __init__(self):
         self.device = settings.MODEL_DEVICE
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("MODEL_DEVICE=cuda but no GPU available, falling back to cpu")
+            self.device = "cpu"
         self.model_dir = Path(settings.MODEL_DIR)
         self.classifier = None
         self.novelty_detector = None
@@ -117,11 +123,12 @@ class ModelLoader:
             ]
             batch_tensor = torch.stack(tensors).to(self.device)
             
-            # Predict
+            # Predict. The model's confidence head is not trained (the loss only uses logits),
+            # so the calibrated softmax probability of the top class is used as confidence.
             with torch.no_grad():
-                logits, confidence = self.classifier(batch_tensor)
+                logits, _ = self.classifier(batch_tensor)
                 probabilities = torch.softmax(logits, dim=1)
-                predicted_classes = torch.argmax(logits, dim=1)
+                confidence, predicted_classes = torch.max(probabilities, dim=1)
             
             # Check for novel taxa
             novelty_scores = None
@@ -147,9 +154,9 @@ class ModelLoader:
                     is_novel = novelty_scores[j] > 0.5
                 
                 # If confidence is low, also mark as potentially novel
-                if conf < 0.7:
+                if conf < NOVELTY_THRESHOLD:
                     is_novel = True
-                
+
                 result = {
                     'sequence': seq[:50] + '...' if len(seq) > 50 else seq,
                     'predicted_class': class_id,
@@ -157,10 +164,14 @@ class ModelLoader:
                     'rank': taxonomy_info.get('rank', 'unknown'),
                     'lineage': taxonomy_info.get('lineage', []),
                     'confidence': float(conf),
-                    'is_novel': is_novel,
+                    'is_novel': bool(is_novel),
+                    'probabilities': {
+                        self.taxonomy_map.get(str(idx), {}).get('name', f'class_{idx}'): float(p)
+                        for idx, p in enumerate(probs)
+                    },
                     'top_predictions': [
                         {
-                            'class_id': idx,
+                            'class_id': int(idx),
                             'taxon_name': self.taxonomy_map.get(str(idx), {}).get('name', 'Unknown'),
                             'probability': float(probs[idx])
                         }

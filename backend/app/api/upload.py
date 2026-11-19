@@ -2,76 +2,91 @@
 File upload API endpoints
 """
 import logging
-import shutil
+import re
+import uuid
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, HTTPException
 from typing import List
-import aiofiles
 
+import aiofiles
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+
+from app.api.deps import require_permission
 from app.core.config import settings
+from app.core.security import Permission
+from app.db.models import User
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+ALLOWED_EXTENSIONS = ('.fasta', '.fastq', '.fa', '.fq', '.fas', '.fna')
+CHUNK_SIZE = 1024 * 1024
+FILE_ID_PATTERN = re.compile(r"^[0-9a-f-]{36}_[\w.\- ()]+$")
+
+
+def user_upload_dir(user: User) -> Path:
+    path = Path(settings.UPLOAD_DIR) / str(user.id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def resolve_upload(user: User, file_id: str) -> Path:
+    """Map an opaque file ID from /upload back to a file in the user's own folder"""
+    if not FILE_ID_PATTERN.match(file_id):
+        raise HTTPException(status_code=400, detail=f"Invalid file reference: {file_id}")
+    path = user_upload_dir(user) / file_id
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Uploaded file not found: {file_id}")
+    return path
+
 
 @router.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    user: User = Depends(require_permission(Permission.PREDICT_BATCH)),
+):
     """
-    Upload eDNA sequence files and return file paths for analysis
+    Upload eDNA sequence files; returns file IDs to pass to /analyze
     """
-    upload_dir = Path(settings.UPLOAD_DIR)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    
+    upload_dir = user_upload_dir(user)
     uploaded_files = []
-    file_paths = []
-    
+
     for file in files:
-        # Validate file extension
-        if not any(file.filename.endswith(ext) for ext in ['.fasta', '.fastq', '.fa', '.fq', '.fas', '.fna']):
+        original_name = Path(file.filename or "").name
+        if not original_name.lower().endswith(ALLOWED_EXTENSIONS):
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid file format: {file.filename}. Accepted formats: .fasta, .fastq, .fa, .fq, .fas, .fna"
+                detail=f"Invalid file format: {original_name}. Accepted formats: {', '.join(ALLOWED_EXTENSIONS)}"
             )
-        
-        # Generate unique filename to avoid conflicts
-        import uuid
-        unique_filename = f"{uuid.uuid4()}_{file.filename}"
-        file_path = upload_dir / unique_filename
-        
+
+        safe_name = re.sub(r"[^\w.\- ()]", "_", original_name)
+        file_id = f"{uuid.uuid4()}_{safe_name}"
+        file_path = upload_dir / file_id
+        size = 0
+
         try:
-            # Save file
+            # Stream to disk so large files are never held in memory
             async with aiofiles.open(file_path, 'wb') as f:
-                content = await file.read()
-                
-                # Validate file size (100MB default)
-                max_size = 100 * 1024 * 1024  # 100MB
-                if len(content) > max_size:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"File too large: {file.filename}. Maximum size: 100MB"
-                    )
-                
-                await f.write(content)
-            
-            uploaded_files.append({
-                'filename': file.filename,
-                'path': str(file_path),
-                'size': len(content)
-            })
-            file_paths.append(str(file_path))
-            
-            logger.info(f"Uploaded file: {file.filename} ({len(content)} bytes) -> {file_path}")
-            
+                while chunk := await file.read(CHUNK_SIZE):
+                    size += len(chunk)
+                    if size > settings.MAX_UPLOAD_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large: {original_name}. Maximum size: {settings.MAX_UPLOAD_SIZE // (1024 * 1024)}MB"
+                        )
+                    await f.write(chunk)
         except Exception as e:
-            logger.error(f"Error uploading {file.filename}: {e}")
-            # Clean up partial upload
-            if file_path.exists():
-                file_path.unlink()
-            raise HTTPException(status_code=500, detail=str(e))
-    
+            file_path.unlink(missing_ok=True)
+            if isinstance(e, HTTPException):
+                raise
+            logger.error(f"Error uploading {original_name}: {e}")
+            raise HTTPException(status_code=500, detail="Upload failed")
+
+        uploaded_files.append({'filename': original_name, 'path': file_id, 'size': size})
+        logger.info(f"User {user.id} uploaded {original_name} ({size} bytes)")
+
     return {
         'message': f'Successfully uploaded {len(uploaded_files)} files',
         'files': uploaded_files,
-        'file_paths': file_paths  # Return paths for analysis
+        'file_paths': [f['path'] for f in uploaded_files],  # opaque IDs for /analyze
     }

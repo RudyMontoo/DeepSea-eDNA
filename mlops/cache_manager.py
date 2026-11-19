@@ -25,6 +25,8 @@ class CacheManager:
         self.redis_client = None
         self.memory_cache = {}  # Fallback in-memory cache
         self.use_redis = False
+        self.memory_hits = 0
+        self.memory_misses = 0
         
         # Try to connect to Redis
         if redis_url or os.getenv("REDIS_URL"):
@@ -75,7 +77,9 @@ class CacheManager:
             else:
                 # Use in-memory cache
                 if key in self.memory_cache:
+                    self.memory_hits += 1
                     return self.memory_cache[key]
+                self.memory_misses += 1
         except Exception as e:
             print(f"Cache get error: {e}")
         
@@ -194,6 +198,9 @@ class CacheManager:
                     "connected": True,
                     "total_keys": len(self.memory_cache),
                     "prediction_keys": len([k for k in self.memory_cache.keys() if k.startswith("pred:")]),
+                    "hits": self.memory_hits,
+                    "misses": self.memory_misses,
+                    "hit_rate": self._calculate_hit_rate(self.memory_hits, self.memory_misses),
                     "ttl_seconds": self.ttl_seconds,
                     "note": "In-memory cache (Redis not available)"
                 }
@@ -204,6 +211,14 @@ class CacheManager:
                 "error": str(e)
             }
     
+    def close(self):
+        """Close the Redis connection, if any"""
+        if self.redis_client:
+            try:
+                self.redis_client.close()
+            except Exception as e:
+                print(f"Cache close error: {e}")
+
     @staticmethod
     def _calculate_hit_rate(hits: int, misses: int) -> float:
         """Calculate cache hit rate percentage"""

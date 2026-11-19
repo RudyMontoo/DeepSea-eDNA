@@ -8,7 +8,39 @@
 
 **Production-ready MLOps platform for marine taxonomic classification using deep learning on environmental DNA sequences.**
 
-🎉 **ALL 15 FEATURES COMPLETE** | ⚡ **94.18% Accuracy** | 🐳 **Docker Ready** | 🚀 **Production Ready**
+---
+
+## 🖥️ Frontend Web Application (React + TypeScript + Vite)
+
+### Setup & Development
+
+1. **Install dependencies**:
+   ```bash
+   npm install
+   ```
+
+2. **Configure environment variables**:
+   Copy `.env.example` to `.env` and set the FastAPI backend URL:
+   ```env
+   VITE_API_BASE_URL=http://localhost:8000
+   ```
+   You can also override the API URL at runtime from the top-bar **API settings** popover, the login screen, or **Profile & Settings** (stored in memory only).
+
+3. **Run the development server** (port `3000`):
+   ```bash
+   npm run dev
+   ```
+
+4. **Build & type-check**:
+   ```bash
+   npm run lint
+   npm run build
+   ```
+
+### Architecture
+- `src/lib/api.ts`: Centralized Axios client with Bearer injection, automatic `/auth/refresh` on `401`, and structured handling for `401`, `403`, `413`, `422`, and network/CORS errors.
+- `src/store/authStore.ts`: Zustand store persisting tokens in memory + `sessionStorage`, runtime API override in memory, and Dark/Light theme state.
+- `src/pages/`: `LoginPage`, `DashboardPage`, `ClassifyPage`, `TaxaExplorerPage`, `ModelsPage`, `ExperimentsPage`, `MonitoringPage`, `AdminPage`, `SettingsPage`.
 
 ---
 
@@ -59,7 +91,6 @@ Environmental DNA (eDNA) is genetic material obtained from environmental samples
 
 ### 💾 Data Management
 
-- ✅ **Database Integration** - SQLAlchemy with SQLite/PostgreSQL
 - ✅ **File Upload** - FASTA, FASTQ, CSV batch processing
 - ✅ **Caching** - Redis with in-memory fallback
 - ✅ **Export Formats** - BIOM, JSON, CSV, FASTA, TSV
@@ -109,61 +140,50 @@ docker run -d \
   ghcr.io/jackstealer/deepsea-edna:latest
 ```
 
-#### Docker Compose
+#### Docker Compose (recommended for real users)
 
-Create a `docker-compose.yml` file:
-
-```yaml
-version: "3.8"
-services:
-  api:
-    image: ghcr.io/jackstealer/deepsea-edna:latest
-    ports:
-      - "8000:8000"
-    environment:
-      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
-      - DATABASE_URL=postgresql://postgres:password@db:5432/deepsea
-      - REDIS_URL=redis://redis:6379/0
-      - ENVIRONMENT=production
-    depends_on:
-      - db
-      - redis
-    volumes:
-      - ./ml_models:/app/ml_models
-    restart: unless-stopped
-
-  db:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_DB: deepsea
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-
-volumes:
-  postgres_data:
-```
-
-Run with:
+The repository ships a production-style `docker-compose.yml`: PostgreSQL, Redis,
+the FastAPI backend and an nginx-served frontend, with data in persistent volumes.
 
 ```bash
-docker-compose up -d
+cp .env.example .env
+# Edit .env: set SECRET_KEY, POSTGRES_PASSWORD and ADMIN_EMAILS (your email)
+docker compose up -d --build
 ```
 
-Access at: http://localhost:8000/api/docs
+- App: http://localhost:3000
+- API docs: http://localhost:8000/api/docs
+
+Database migrations run automatically when the backend starts. The backend refuses
+to start in production with the default `SECRET_KEY`.
+
+#### Accounts, roles and sign-in
+
+- Users sign up with email + password, **Google** or **GitHub**. Signing in with a
+  provider that uses the same verified email links to the existing account.
+- New accounts are `viewer`s. Emails listed in `ADMIN_EMAILS` are always `admin`;
+  admins promote others (`scientist`, `api_user`) or disable accounts on the Admin page.
+- Every user sees only their own history, jobs and exports. System monitoring is admin-only.
+
+**Enable Google sign-in:** Google Cloud Console → APIs & Services → Credentials →
+Create OAuth client ID (Web application). Add the authorized redirect URI
+`http://localhost:8000/auth/oauth/google/callback` (use your `BACKEND_PUBLIC_URL` in
+production), then put the client ID and secret in `.env` as `GOOGLE_CLIENT_ID` /
+`GOOGLE_CLIENT_SECRET`.
+
+**Enable GitHub sign-in:** GitHub → Settings → Developer settings → OAuth Apps →
+New OAuth App. Homepage URL `http://localhost:3000`, authorization callback URL
+`http://localhost:8000/auth/oauth/github/callback`. Put the values in `.env` as
+`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`.
+
+Buttons for a provider appear on the login page only once its keys are set.
+Restart the backend after editing `.env` (`docker compose up -d`).
 
 ### 💻 Local Development
 
 #### Prerequisites
 
 - Python 3.11+
-- PostgreSQL (optional, SQLite used by default)
 - Redis (optional, in-memory fallback available)
 
 #### Installation
@@ -181,6 +201,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r backend/requirements.txt
 
 # Start API
+cd backend
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -386,9 +407,9 @@ Authorization: Bearer <token>
 │  └──────────────┘  └──────────────┘  └──────────────┘ │
 │                                                          │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │ A/B Testing  │  │ Caching      │  │ Database     │ │
-│  │ - Experiments│  │ - Redis      │  │ - SQLAlchemy │ │
-│  │ - Statistics │  │ - Fallback   │  │ - History    │ │
+│  │ A/B Testing  │  │ Caching      │  │ Export       │ │
+│  │ - Experiments│  │ - Redis      │  │ - BIOM/FASTA │ │
+│  │ - Statistics │  │ - Fallback   │  │ - CSV/TSV    │ │
 │  └──────────────┘  └──────────────┘  └──────────────┘ │
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐  │
@@ -405,9 +426,7 @@ Authorization: Bearer <token>
 
 - FastAPI 0.136+ (Modern async Python web framework)
 - PyTorch 2.0+ (Deep learning framework)
-- SQLAlchemy (Database ORM)
-- Redis (Caching layer)
-- PostgreSQL/SQLite (Database)
+- Redis (Caching layer, optional)
 
 **Security:**
 
@@ -564,61 +583,41 @@ Current test coverage: **85%+**
 DeepSea-eDNA-AI/
 ├── backend/
 │   ├── app/
-│   │   ├── api/              # API route handlers
-│   │   │   ├── auth.py       # Authentication endpoints
-│   │   │   ├── predict.py    # Prediction endpoints
-│   │   │   ├── monitoring.py # Monitoring endpoints
-│   │   │   └── versions.py   # Model versioning
-│   │   ├── core/             # Core configuration
-│   │   │   ├── config.py     # App configuration
-│   │   │   ├── security.py   # Security utilities
-│   │   │   └── database.py   # Database setup
-│   │   ├── models/           # Database & ML models
-│   │   │   ├── user.py       # User model
-│   │   │   ├── prediction.py # Prediction model
-│   │   │   └── ml_model.py   # ML model wrapper
-│   │   ├── services/         # Business logic
-│   │   │   ├── auth.py       # Auth service
-│   │   │   ├── predict.py    # Prediction service
-│   │   │   └── cache.py      # Cache service
-│   │   └── main.py           # FastAPI application
-│   ├── tests/                # Test suite
-│   │   ├── test_auth.py      # Auth tests
-│   │   ├── test_predict.py   # Prediction tests
-│   │   └── test_integration.py # Integration tests
-│   ├── training/             # Model training scripts
-│   │   ├── train.py          # Training script
-│   │   ├── evaluate.py       # Evaluation script
-│   │   └── data_loader.py    # Data loading
-│   └── requirements.txt      # Python dependencies
+│   │   ├── api/                  # /api/* route handlers
+│   │   │   ├── analysis.py       # File analysis jobs
+│   │   │   ├── export.py         # JSON/CSV/TSV/BIOM/FASTA export
+│   │   │   ├── models.py         # Single & batch prediction
+│   │   │   └── upload.py         # FASTA/FASTQ upload
+│   │   ├── core/                 # Settings & logging
+│   │   ├── models/
+│   │   │   └── deep_learning.py  # CNN + attention classifier
+│   │   ├── services/             # Model loader, sequence processing
+│   │   └── main.py               # FastAPI app (auth, monitoring, versions, experiments)
+│   ├── tests/
+│   │   └── test_integration.py   # API test suite (pytest)
+│   ├── training/
+│   │   └── train_model.py        # Model training script
+│   └── requirements.txt          # Python dependencies
 ├── mlops/
-│   ├── advanced_security.py  # JWT & RBAC implementation
-│   ├── ab_testing.py         # A/B testing system
-│   ├── model_versioning.py   # Model registry & versioning
-│   ├── monitoring.py         # Metrics & health checks
-│   ├── cache_manager.py      # Redis caching layer
-│   ├── data_validation.py    # Input validation
-│   ├── export_formats.py     # Data export formats
-│   └── test_*.ps1            # Feature test scripts
+│   ├── advanced_security.py      # JWT & RBAC implementation
+│   ├── ab_testing.py             # A/B testing system
+│   ├── model_versioning.py       # Model registry & versioning
+│   ├── monitoring.py             # Metrics & health checks
+│   ├── cache_manager.py          # Redis caching layer
+│   └── export_formats.py         # Data export formats
 ├── ml_models/
-│   └── marine_model/         # Trained model files
-│       ├── best_model.pth    # PyTorch model weights
-│       ├── model_config.json # Model configuration
-│       └── taxonomy_map.json # Species mapping
+│   └── marine_model/             # Trained model files
+│       ├── best_model.pth        # PyTorch model weights
+│       ├── model_config.json     # Model configuration
+│       └── taxonomy_map.json     # Species mapping
 ├── data/
-│   ├── training/             # Training datasets
-│   └── samples/              # Sample sequences
-├── .github/
-│   └── workflows/            # GitHub Actions CI/CD
-│       ├── docker-build.yml  # Docker build & push
-│       └── tests.yml         # Automated tests
-├── docs/                     # Additional documentation
-├── Dockerfile                # Docker configuration
-├── docker-compose.yml        # Multi-container setup
-├── .gitignore                # Git ignore rules
-├── .pylintrc                 # Python linting config
-├── demo_sequences.fasta      # Demo sequences for testing
-└── README.md                 # This file
+│   └── training/marine_diverse/  # Training dataset (8 classes)
+├── src/                          # React + TypeScript frontend
+├── .github/workflows/            # CI tests, PR checks, Docker build, training
+├── Dockerfile                    # Backend container
+├── index.html, vite.config.ts    # Frontend entry & build config
+├── package.json                  # Frontend dependencies
+└── README.md                     # This file
 ```
 
 ---
@@ -722,7 +721,6 @@ This project is free and open-source software licensed under the MIT License. Yo
 - [FastAPI Documentation](https://fastapi.tiangolo.com/) - Web framework
 - [PyTorch Documentation](https://pytorch.org/docs/) - Deep learning
 - [Docker Documentation](https://docs.docker.com/) - Containerization
-- [SQLAlchemy Documentation](https://docs.sqlalchemy.org/) - Database ORM
 - [Prometheus Documentation](https://prometheus.io/docs/) - Monitoring
 
 ### Scientific Background
