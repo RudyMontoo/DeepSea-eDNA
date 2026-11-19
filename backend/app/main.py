@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, HTTPException, Request, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.gzip import GZipMiddleware
 from prometheus_client import make_asgi_app
 
 # Add parent directory to path for mlops imports
@@ -99,7 +98,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 app.include_router(upload.router, prefix="/api", tags=["Upload"])
