@@ -15,6 +15,7 @@
 | 🖥️ Frontend | **https://deepsea-edna-ai-eta.vercel.app** |
 | ⚙️ Backend API | **https://deepsea-backend-t9oy.onrender.com** |
 | 📘 API Docs (Swagger) | **https://deepsea-backend-t9oy.onrender.com/api/docs** |
+| ☁️ AWS Deployment (EC2 + CloudFront) | **https://app.16-179-237-170.sslip.io/** |
 
 📄 See [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) for what the project does and which technology does what.
 
