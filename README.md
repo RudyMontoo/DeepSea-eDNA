@@ -8,6 +8,16 @@
 
 **Production-ready MLOps platform for marine taxonomic classification using deep learning on environmental DNA sequences.**
 
+## 🔗 Live Deployment
+
+| Service | URL |
+|---|---|
+| 🖥️ Frontend | **https://deepsea-edna-ai-eta.vercel.app** |
+| ⚙️ Backend API | **https://deepsea-backend-t9oy.onrender.com** |
+| 📘 API Docs (Swagger) | **https://deepsea-backend-t9oy.onrender.com/api/docs** |
+
+📄 See [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) for what the project does and which technology does what.
+
 ---
 
 ## 🖥️ Frontend Web Application (React + TypeScript + Vite)
