@@ -1,0 +1,14 @@
+/node_modules
+/backend
+/mlops
+/data
+/ml_models
+/deploy
+/scripts
+/.git
+/.github
+*.md
+/docker-compose.yml
+/Dockerfile
+/Dockerfile.frontend
+/render.yaml

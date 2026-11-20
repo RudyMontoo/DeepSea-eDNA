@@ -118,3 +118,5 @@ ml_models/experiments.json
 # TypeScript incremental build cache
 *.tsbuildinfo
 backend/venv_linux/
+.vercel
+.env*
