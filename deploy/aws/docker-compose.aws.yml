@@ -1,0 +1,22 @@
+# AWS EC2 overrides, used together with the main file:
+#   docker compose -f docker-compose.yml -f deploy/aws/docker-compose.aws.yml up -d --build
+services:
+  mlflow:
+    # MLflow has no authentication: reachable only on the instance itself
+    # (use an SSM port-forwarding session to open the UI from your machine)
+    ports: !override
+      - "127.0.0.1:5000:5000"
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --workers=1  # fits a small instance
+      - --backend-store-uri=sqlite:////mlflow/mlflow.db
+      - --artifacts-destination=/mlflow/artifacts
+      - --allowed-hosts=mlflow:5000,localhost:5000,127.0.0.1:5000
+
+  backend:
+    environment:
+      # Only CloudFront can reach the instance, so its viewer-address header is the real client IP
+      TRUSTED_PROXY_HEADER: cloudfront-viewer-address

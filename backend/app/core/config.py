@@ -76,6 +76,8 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     ADMIN_EMAILS: str = ""  # Comma-separated; these accounts are always admins
     LOGIN_RATE_LIMIT_PER_MINUTE: int = 10
+    # Header carrying the real client IP when behind a trusted proxy (e.g. cloudfront-viewer-address)
+    TRUSTED_PROXY_HEADER: str = ""
 
     # OAuth providers (leave blank to hide the button)
     GOOGLE_CLIENT_ID: str = ""

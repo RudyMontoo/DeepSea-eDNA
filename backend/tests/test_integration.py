@@ -326,6 +326,21 @@ class TestSystem:
             limiter.check("ip")
         assert exc.value.status_code == 429
 
+    def test_client_ip_from_trusted_proxy_header(self, monkeypatch):
+        from starlette.requests import Request
+        from app.core.config import settings
+        from app.core.rate_limit import client_ip
+
+        def make(header_value):
+            headers = [(b"cloudfront-viewer-address", header_value.encode())] if header_value else []
+            return Request({"type": "http", "headers": headers, "client": ("10.0.0.9", 1234)})
+
+        assert client_ip(make("203.0.113.7:443")) == "10.0.0.9"  # header ignored unless trusted
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HEADER", "cloudfront-viewer-address")
+        assert client_ip(make("203.0.113.7:443")) == "203.0.113.7"
+        assert client_ip(make("2001:db8::1:443")) == "2001:db8::1"
+        assert client_ip(make(None)) == "10.0.0.9"
+
     def test_security_headers(self):
         response = client.get("/health")
         assert response.headers["x-content-type-options"] == "nosniff"
